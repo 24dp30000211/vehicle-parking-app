@@ -1,0 +1,136 @@
+### 1. Register a new user (Run this after a database reset)
+POST http://127.0.0.1:5000/api/register
+Content-Type: application/json
+
+{
+  "username": "testuser",
+  "email": "test@example.com",
+  "password": "securepassword"
+}
+
+### 2. Login as the admin (and save the token)
+# @name loginAdmin
+POST http://127.0.0.1:5000/api/login
+Content-Type: application/json
+
+{
+  "username": "admin",
+  "password": "adminpassword"
+}
+
+### 3. Login as the test user (and save the token)
+# @name loginUser
+POST http://127.0.0.1:5000/api/login
+Content-Type: application/json
+
+{
+  "username": "testuser",
+  "password": "securepassword"
+}
+
+### 4. Create a new Parking Lot (as Admin)
+# This request will use the token from the "loginAdmin" request
+POST http://127.0.0.1:5000/api/lots
+Content-Type: application/json
+Authorization: Bearer {{loginAdmin.response.body.access_token}}
+
+{
+  "name": "Downtown Central Lot",
+  "address": "123 Main St",
+  "pincode": "10001",
+  "capacity": 50,
+  "price_per_hour": 15.50
+}
+
+### 5. TRY to Create a Lot (as User)
+# This will fail (403 Forbidden), proving our security works.
+POST http://127.0.0.1:5000/api/lots
+Content-Type: application/json
+Authorization: Bearer {{loginUser.response.body.access_token}}
+
+{
+  "name": "User Test Lot",
+  "address": "456 Side St",
+  "pincode": "20002",
+  "capacity": 10,
+  "price_per_hour": 5.00
+}
+
+### 6. Get Available Lots (as User)
+# This uses the token from the "loginUser" request
+GET http://127.0.0.1:5000/api/lots
+Authorization: Bearer {{loginUser.response.body.access_token}}
+
+### 7. Book a Spot (as User)
+# This uses the token from the "loginUser" request
+POST http://127.0.0.1:5000/api/book
+Content-Type: application/json
+Authorization: Bearer {{loginUser.response.body.access_token}}
+
+{
+  "lot_id": 1
+}
+
+### 8. Get My Bookings (as User)
+# This uses the token from the "loginUser" request
+GET http://127.0.0.1:5000/api/bookings
+Authorization: Bearer {{loginUser.response.body.access_token}}
+
+### 9. Release a Spot (as User)
+# This uses the token from the "loginUser" request
+# We assume we are releasing booking_id 1
+PUT http://127.0.0.1:5000/api/release/1
+Authorization: Bearer {{loginUser.response.body.access_token}}
+
+### 10. (ADMIN) Get All Lots
+# This uses the token from the "loginAdmin" request
+GET http://127.0.0.1:5000/api/admin/lots
+Authorization: Bearer {{loginAdmin.response.body.access_token}}
+
+### 11. (ADMIN) Get Details for Lot 1
+# This uses the token from the "loginAdmin" request
+GET http://127.0.0.1:5000/api/admin/lots/1
+Authorization: Bearer {{loginAdmin.response.body.access_token}}
+
+### 12. (ADMIN) TRY to Delete Lot 1 (While Occupied)
+# This uses the token from the "loginAdmin" request
+# This test will FAIL if you run "Book a Spot" first
+DELETE http://127.0.0.1:5000/api/admin/lots/1
+Authorization: Bearer {{loginAdmin.response.body.access_token}}
+
+### 13. (ADMIN) Delete Lot 2 (Empty)
+# This uses the token from the "loginAdmin" request
+#DELETE http://127.0.0.1:5000/api/admin/lots/1
+#Authorization: Bearer {{loginAdmin.response.body.access_token}}
+
+### 14. (ADMIN) Edit Lot 1
+# This uses the token from the "loginAdmin" request
+PUT http://127.0.0.1:5000/api/admin/lots/2
+Authorization: Bearer {{loginAdmin.response.body.access_token}}
+Content-Type: application/json
+
+{
+    "name": "Super Mega Lot (Renamed)",
+    "price_per_hour": 25.0,
+    "capacity": 55
+}
+
+### 15. (USER) Trigger CSV Export
+# This uses the token from the "loginUser" request
+POST http://127.0.0.1:5000/api/export-csv
+Authorization: Bearer {{loginUser.response.body.access_token}}
+
+### 16. (ADMIN) Get All Users
+# This uses the token from the "loginAdmin" request
+GET http://127.0.0.1:5000/api/admin/users
+Authorization: Bearer {{loginAdmin.response.body.access_token}}
+
+### 17. (ADMIN) Get Dashboard Summary
+# This uses the token from the "loginAdmin" request
+GET http://127.0.0.1:5000/api/admin/summary
+Authorization: Bearer {{loginAdmin.response.body.access_token}}
+
+### 18. (USER) Get Dashboard Summary
+# This uses the token from the "loginUser" request
+GET http://127.0.0.1:5000/api/user/summary
+Authorization: Bearer {{loginUser.response.body.access_token}}
