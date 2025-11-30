@@ -1,430 +1,291 @@
 import csv
 import io
-from flask_mail import Mail, Message
 import os
+import datetime
+import json
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import datetime
+from flask_mail import Mail, Message
+from flask_jwt_extended import create_access_token, jwt_required, get_jwt_identity, JWTManager
+from functools import wraps
+import redis
+
+# Custom imports for database and models
 from database import db
 from models import User, ParkingLot, ParkingSpot, Booking
-from flask_jwt_extended import create_access_token, jwt_required, get_jwt_identity, JWTManager
-import json
-import redis # <-- NEW: Import Redis
 
-# --- App and DB Setup ---
+# Setup file paths
 base_dir = os.path.abspath(os.path.dirname(__file__))
+
 app = Flask(__name__)
+
+# --- Application Configuration ---
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///' + os.path.join(base_dir, 'parking.db')
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config["JWT_SECRET_KEY"] = "super-secret-key-change-in-prod"
 
-# --- JWT Config ---
-app.config["JWT_SECRET_KEY"] = "your-super-secret-key"
-
-# --- Mail Config ---
+# Email Configuration (Using localhost debugging server for dev)
 app.config['MAIL_SERVER'] = 'localhost'
 app.config['MAIL_PORT'] = 1025
 app.config['MAIL_USE_TLS'] = False
 app.config['MAIL_USERNAME'] = None
 app.config['MAIL_PASSWORD'] = None
-app.config['MAIL_DEFAULT_SENDER'] = 'parking-app@localhost'
+app.config['MAIL_DEFAULT_SENDER'] = 'no-reply@parkprime.local'
 
-# --- NEW: Redis Cache Config ---
-try:
-    cache = redis.StrictRedis(host='localhost', port=6379, db=1, decode_responses=True)
-    cache.ping()
-    print("Connected to Redis cache successfully!")
-except Exception as e:
-    print(f"Could not connect to Redis cache: {e}")
-    cache = None
-
-# --- Initialize Extensions ---
+# Initialize plugins
 mail = Mail(app)
 jwt = JWTManager(app)
 db.init_app(app)
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 
-# --- NEW: Cache Clearing Helper ---
-def clear_cache(keys):
-    """Helper function to clear one or more cache keys."""
-    if cache:
-        for key in keys:
-            cache.delete(key)
-        print(f"Cache cleared for keys: {keys}")
+# Initialize Redis for Caching
+# If Redis is not running, this might raise a ConnectionError later.
+try:
+    cache = redis.Redis(host='localhost', port=6379, db=0)
+    # Check connection cheaply
+    # cache.ping() 
+except:
+    cache = None
 
-# --- Admin Decorator ---
-from functools import wraps
-def admin_required():
+# --- Helper Decorator ---
+# This custom decorator checks if the current user has 'admin' privileges
+def admin_access_only():
     def wrapper(fn):
         @wraps(fn)
         def decorator(*args, **kwargs):
-            user_id = int(get_jwt_identity())
-            user = User.query.get(user_id)
+            current_id = get_jwt_identity()
+            user = User.query.get(int(current_id))
+            
             if user and user.role == 'admin':
                 return fn(*args, **kwargs)
             else:
-                return jsonify({"message": "Admins only!"}), 403
+                return jsonify({"message": "Access Denied: Admins Only"}), 403
         return decorator
     return wrapper
 
-# --- === Authentication API === ---
+# --- Helper Function for Caching ---
+def clear_cache(patterns):
+    """Clears Redis cache keys matching the given patterns."""
+    if not cache: return
+    try:
+        keys_to_delete = []
+        for pattern in patterns:
+            keys = cache.keys(pattern)
+            keys_to_delete.extend(keys)
+        
+        if keys_to_delete:
+            cache.delete(*keys_to_delete)
+            print(f"DEBUG: Cache cleared for keys: {keys_to_delete}")
+    except Exception as e:
+        print(f"WARNING: Redis cache clear failed: {e}")
+
+# ==========================================
+# AUTHENTICATION ROUTES
+# ==========================================
 
 @app.route('/api/register', methods=['POST'])
-def register_user():
-    # ... (existing code, no changes) ...
+def process_registration():
     data = request.get_json()
-    username = data.get('username')
-    email = data.get('email')
-    password = data.get('password')
+    # Extract fields
+    u_name = data.get('username')
+    u_email = data.get('email')
+    u_pass = data.get('password')
 
-    if not username or not email or not password:
-        return jsonify({'message': 'Missing required fields'}), 400
+    if not u_name or not u_email or not u_pass:
+        return jsonify({'message': 'Validation Error: Missing required fields'}), 400
 
-    if User.query.filter_by(username=username).first() or User.query.filter_by(email=email).first():
-        return jsonify({'message': 'Username already exists'}), 409
+    # Check for duplicate users
+    existing = User.query.filter_by(username=u_name).first()
+    if existing:
+        return jsonify({'message': 'Username taken'}), 409
 
-    new_user = User(username=username, email=email, role='user')
-    new_user.set_password(password)
-    db.session.add(new_user)
+    # Create new user record
+    new_entry = User(username=u_name, email=u_email, role='user')
+    new_entry.set_password(u_pass)
+    
+    db.session.add(new_entry)
     db.session.commit()
+    print(f"DEBUG: New user registered: {u_name}")
     
-    # --- NEW: Clear admin's user list cache ---
-    clear_cache(['/api/admin/users', '/api/admin/summary'])
-    
-    return jsonify({'message': 'User registered successfully'}), 201
+    return jsonify({'message': 'Registration successful'}), 201
 
 @app.route('/api/login', methods=['POST'])
-def login_user():
-    # ... (existing code, no changes) ...
+def perform_login():
     data = request.get_json()
     username = data.get('username')
     password = data.get('password')
-
-    if not username or not password:
-        return jsonify({'message': 'Missing username or password'}), 400
 
     user = User.query.filter_by(username=username).first()
 
     if user and user.check_password(password):
-        access_token = create_access_token(identity=str(user.id))
+        # Generate token with user ID as string identity
+        token = create_access_token(identity=str(user.id))
+        print(f"DEBUG: Login successful for {username}")
+        
         return jsonify({
             'message': 'Login successful',
-            'access_token': access_token,
+            'access_token': token,
             'role': user.role
         }), 200
     
-    return jsonify({'message': 'Invalid username or password'}), 401
+    print(f"DEBUG: Failed login attempt for {username}")
+    return jsonify({'message': 'Bad credentials'}), 401
 
-# --- === User API === ---
-
-@app.route('/api/lots', methods=['GET'])
-@jwt_required()
-def get_available_lots():
-    # --- NEW: Caching Logic ---
-    cache_key = '/api/lots'
-    if cache:
-        cached_data = cache.get(cache_key)
-        if cached_data:
-            print(f"Cache HIT for {cache_key}")
-            return jsonify(json.loads(cached_data)), 200
-    print(f"Cache MISS for {cache_key}")
-    
-    # ... (existing code) ...
-    available_lots = db.session.query(ParkingLot).join(ParkingSpot).filter(
-        ParkingSpot.status == 'available'
-    ).group_by(ParkingLot.id).all()
-
-    results = []
-    for lot in available_lots:
-        results.append({
-            'id': lot.id,
-            'name': lot.name,
-            'address': lot.address,
-            'pincode': lot.pincode,
-            'price_per_hour': lot.price_per_hour
-        })
-    
-    # --- NEW: Save to cache ---
-    if cache:
-        # Cache for 5 minutes
-        cache.setex(cache_key, 300, json.dumps(results))
-
-    return jsonify(results), 200
-
-@app.route('/api/book', methods=['POST'])
-@jwt_required()
-def book_spot():
-    # ... (existing code) ...
-    user_id = int(get_jwt_identity())
-    data = request.get_json()
-    lot_id = data.get('lot_id')
-
-    if not lot_id:
-        return jsonify({"message": "Missing lot_id"}), 400
-
-    available_spot = ParkingSpot.query.filter_by(
-        lot_id=lot_id,
-        status='available'
-    ).first()
-
-    if not available_spot:
-        return jsonify({"message": "No available spots in this lot"}), 404
-
-    available_spot.status = 'occupied'
-    
-    new_booking = Booking(
-        user_id=user_id,
-        spot_id=available_spot.id,
-        check_in_time=datetime.datetime.utcnow(),
-        is_active=True
-    )
-
-    db.session.add(new_booking)
-    db.session.add(available_spot)
-    db.session.commit()
-    
-    # --- NEW: Clear all relevant caches ---
-    clear_cache([
-        '/api/lots', '/api/admin/lots', '/api/admin/summary', 
-        f'/api/user/summary/{user_id}', f'/api/bookings/{user_id}',
-        f'/api/admin/lots/{lot_id}'
-    ])
-
-    return jsonify({
-        "message": "Spot booked successfully",
-        "booking_id": new_booking.id,
-        "spot_number": available_spot.spot_number,
-        "check_in_time": new_booking.check_in_time
-    }), 201
-
-@app.route('/api/bookings', methods=['GET'])
-@jwt_required()
-def get_user_bookings():
-    user_id = int(get_jwt_identity())
-    
-    # --- NEW: Caching Logic ---
-    cache_key = f'/api/bookings/{user_id}'
-    if cache:
-        cached_data = cache.get(cache_key)
-        if cached_data:
-            print(f"Cache HIT for {cache_key}")
-            return jsonify(json.loads(cached_data)), 200
-    print(f"Cache MISS for {cache_key}")
-    
-    # ... (existing code) ...
-    bookings = Booking.query.filter_by(user_id=user_id).order_by(Booking.check_in_time.desc()).all()
-
-    if not bookings:
-        return jsonify([]), 200
-
-    results = []
-    for booking in bookings:
-        spot = ParkingSpot.query.get(booking.spot_id)
-        lot = ParkingLot.query.get(spot.lot_id)
-        results.append({
-            'booking_id': booking.id,
-            'lot_name': lot.name,
-            'spot_number': spot.spot_number,
-            'check_in_time': str(booking.check_in_time),
-            'check_out_time': str(booking.check_out_time) if booking.check_out_time else None,
-            'is_active': booking.is_active,
-            'total_cost': booking.total_cost
-        })
-        
-    # --- NEW: Save to cache ---
-    if cache:
-        cache.setex(cache_key, 300, json.dumps(results))
-
-    return jsonify(results), 200
-
-@app.route('/api/release/<int:booking_id>', methods=['PUT'])
-@jwt_required()
-def release_spot(booking_id):
-    # ... (existing code) ...
-    user_id = int(get_jwt_identity())
-    booking = Booking.query.filter_by(id=booking_id, user_id=user_id, is_active=True).first()
-
-    if not booking:
-        return jsonify({"message": "Active booking not found or you do not have permission"}), 404
-
-    check_out_time = datetime.datetime.utcnow()
-    duration = check_out_time - booking.check_in_time
-    duration_in_hours = duration.total_seconds() / 3600
-    spot = ParkingSpot.query.get(booking.spot_id)
-    lot = ParkingLot.query.get(spot.lot_id)
-    total_cost = duration_in_hours * lot.price_per_hour
-
-    booking.is_active = False
-    booking.check_out_time = check_out_time
-    booking.total_cost = round(total_cost, 2)
-    spot.status = 'available'
-
-    db.session.add(booking)
-    db.session.add(spot)
-    db.session.commit()
-    
-    # --- NEW: Clear all relevant caches ---
-    clear_cache([
-        '/api/lots', '/api/admin/lots', '/api/admin/summary',
-        f'/api/user/summary/{user_id}', f'/api/bookings/{user_id}',
-        f'/api/admin/lots/{spot.lot_id}'
-    ])
-
-    return jsonify({
-        "message": "Spot released successfully",
-        "booking_id": booking.id,
-        "total_cost": booking.total_cost,
-        "duration_in_hours": round(duration_in_hours, 2)
-    }), 200
-
-@app.route('/api/export-csv', methods=['POST'])
-@jwt_required()
-def trigger_csv_export():
-    from tasks import generate_csv_task
-    user_id = int(get_jwt_identity())
-    generate_csv_task.delay(user_id) 
-    return jsonify({
-        "message": "CSV generation has started. You will receive an email shortly."
-    }), 202
-
-@app.route('/api/user/summary', methods=['GET'])
-@jwt_required()
-def get_user_summary():
-    user_id = int(get_jwt_identity())
-    
-    # --- NEW: Caching Logic ---
-    cache_key = f'/api/user/summary/{user_id}'
-    if cache:
-        cached_data = cache.get(cache_key)
-        if cached_data:
-            print(f"Cache HIT for {cache_key}")
-            return jsonify(json.loads(cached_data)), 200
-    print(f"Cache MISS for {cache_key}")
-    
-    # ... (existing code) ...
-    total_bookings = Booking.query.filter_by(user_id=user_id).count()
-    active_bookings = Booking.query.filter_by(
-        user_id=user_id, 
-        is_active=True
-    ).count()
-    total_spent = db.session.query(
-        db.func.sum(Booking.total_cost)
-    ).filter(
-        Booking.user_id == user_id,
-        Booking.is_active == False
-    ).scalar()
-    
-    result = {
-        'total_bookings': total_bookings,
-        'active_bookings': active_bookings,
-        'total_spent': round(total_spent or 0, 2) 
-    }
-    
-    # --- NEW: Save to cache ---
-    if cache:
-        cache.setex(cache_key, 300, json.dumps(result))
-
-    return jsonify(result), 200
-
-# --- === Admin API === ---
-
-@app.route('/api/admin/lots', methods=['POST'])
-@jwt_required()
-@admin_required()
-def create_parking_lot():
-    # ... (existing code) ...
-    data = request.get_json()
-    name = data.get('name')
-    address = data.get('address')
-    pincode = data.get('pincode')
-    capacity = data.get('capacity')
-    price = data.get('price_per_hour')
-
-    if not all([name, address, pincode, capacity, price]):
-        return jsonify({"message": "Missing required fields"}), 400
-
-    new_lot = ParkingLot(
-        name=name,
-        address=address,
-        pincode=pincode,
-        capacity=capacity,
-        price_per_hour=price
-    )
-    db.session.add(new_lot)
-    db.session.commit() 
-
-    for i in range(1, capacity + 1):
-        spot = ParkingSpot(
-            lot_id=new_lot.id,
-            spot_number=i,
-            status='available'
-        )
-        db.session.add(spot)
-    
-    db.session.commit()
-    
-    # --- NEW: Clear relevant caches ---
-    clear_cache(['/api/lots', '/api/admin/lots', '/api/admin/summary'])
-
-    return jsonify({"message": f"Parking lot '{name}' created with {capacity} spots"}), 201
+# ==========================================
+# ADMIN ROUTES (Parking Lots)
+# ==========================================
 
 @app.route('/api/admin/lots', methods=['GET'])
 @jwt_required()
-@admin_required()
-def get_all_lots():
-    # --- NEW: Caching Logic ---
-    cache_key = '/api/admin/lots'
+@admin_access_only()
+def fetch_all_lots_admin():
+    # Attempt to fetch from cache first
     if cache:
+        cache_key = "admin_all_lots"
         cached_data = cache.get(cache_key)
+        
         if cached_data:
-            print(f"Cache HIT for {cache_key}")
+            print("DEBUG: Cache HIT for admin lots list")
             return jsonify(json.loads(cached_data)), 200
-    print(f"Cache MISS for {cache_key}")
 
-    # ... (existing code) ...
-    lots = ParkingLot.query.all()
-    if not lots:
-        return jsonify([]), 200
-
-    results = []
-    for lot in lots:
-        available_spots = ParkingSpot.query.filter_by(
-            lot_id=lot.id,
-            status='available'
-        ).count()
-        results.append({
+    print("DEBUG: Cache MISS for admin lots list. Querying DB.")
+    all_lots = ParkingLot.query.all()
+    output = []
+    
+    for lot in all_lots:
+        # Calculate current availability for each lot
+        free_spots = ParkingSpot.query.filter_by(lot_id=lot.id, status='available').count()
+        
+        output.append({
             'id': lot.id,
             'name': lot.name,
             'address': lot.address,
             'capacity': lot.capacity,
             'price_per_hour': lot.price_per_hour,
-            'available_spots': available_spots
+            'available_spots': free_spots
         })
-        
-    # --- NEW: Save to cache ---
+    
+    # Store result in cache for 60 seconds
     if cache:
-        cache.setex(cache_key, 300, json.dumps(results))
+        cache.setex(cache_key, 60, json.dumps(output))
+    
+    return jsonify(output), 200
 
-    return jsonify(results), 200
+@app.route('/api/admin/lots', methods=['POST'])
+@jwt_required()
+@admin_access_only()
+def add_new_lot():
+    data = request.get_json()
+    
+    # Simple validation
+    if not data.get('name') or not data.get('capacity'):
+        return jsonify({"message": "Name and Capacity are required"}), 400
+
+    lot = ParkingLot(
+        name=data.get('name'),
+        address=data.get('address'),
+        pincode=data.get('pincode'),
+        capacity=int(data.get('capacity')),
+        price_per_hour=float(data.get('price_per_hour'))
+    )
+    
+    db.session.add(lot)
+    db.session.commit() # Commit first to get the Lot ID
+    
+    # Auto-generate the individual spots based on capacity
+    print(f"DEBUG: Generating {lot.capacity} spots for Lot {lot.id}")
+    for i in range(1, lot.capacity + 1):
+        spot = ParkingSpot(lot_id=lot.id, spot_number=i)
+        db.session.add(spot)
+        
+    db.session.commit()
+    
+    # Invalidate caches because data changed
+    clear_cache(["admin_all_lots", "user_available_lots", "admin_dashboard_stats"])
+    
+    return jsonify({"message": "Lot created successfully"}), 201
+
+@app.route('/api/admin/lots/<int:lot_id>', methods=['PUT'])
+@jwt_required()
+@admin_access_only()
+def modify_lot(lot_id):
+    lot = ParkingLot.query.get(lot_id)
+    if not lot:
+        return jsonify({"message": "Lot not found"}), 404
+
+    data = request.get_json()
+    
+    # Logic to handle capacity changes is complex, so we verify safety first
+    if 'capacity' in data:
+        new_cap = int(data.get('capacity'))
+        occupied = ParkingSpot.query.filter_by(lot_id=lot_id, status='occupied').count()
+        
+        if new_cap < occupied:
+            return jsonify({"message": "Cannot reduce capacity below occupied count"}), 409
+            
+        # Add or remove spots based on new capacity
+        if new_cap > lot.capacity:
+            for i in range(lot.capacity + 1, new_cap + 1):
+                db.session.add(ParkingSpot(lot_id=lot.id, spot_number=i))
+        elif new_cap < lot.capacity:
+            # Find empty spots at the end and remove them
+            to_remove = ParkingSpot.query.filter(
+                ParkingSpot.lot_id == lot_id, 
+                ParkingSpot.status == 'available'
+            ).order_by(ParkingSpot.spot_number.desc()).limit(lot.capacity - new_cap).all()
+            for s in to_remove:
+                db.session.delete(s)
+                
+        lot.capacity = new_cap
+
+    # Update basic fields
+    if 'name' in data: lot.name = data['name']
+    if 'price_per_hour' in data: lot.price_per_hour = data['price_per_hour']
+    
+    db.session.commit()
+    
+    # Invalidate caches
+    clear_cache(["admin_all_lots", "user_available_lots", f"lot_details_{lot_id}"])
+    
+    return jsonify({"message": "Lot updated"}), 200
+
+@app.route('/api/admin/lots/<int:lot_id>', methods=['DELETE'])
+@jwt_required()
+@admin_access_only()
+def remove_lot(lot_id):
+    lot = ParkingLot.query.get(lot_id)
+    if not lot: return jsonify({"message": "Not found"}), 404
+    
+    # Safety check: Prevent deletion if spots are in use
+    if ParkingSpot.query.filter_by(lot_id=lot_id, status='occupied').count() > 0:
+        return jsonify({"message": "Cannot delete: Lot has active bookings"}), 409
+        
+    db.session.delete(lot)
+    db.session.commit()
+    
+    # Invalidate caches
+    clear_cache(["admin_all_lots", "user_available_lots", "admin_dashboard_stats"])
+    
+    return jsonify({"message": "Lot deleted"}), 200
 
 @app.route('/api/admin/lots/<int:lot_id>', methods=['GET'])
 @jwt_required()
-@admin_required()
+@admin_access_only()
 def get_lot_details(lot_id):
-    # --- NEW: Caching Logic ---
-    cache_key = f'/api/admin/lots/{lot_id}'
+    # This detail view is also cacheable
     if cache:
+        cache_key = f"lot_details_{lot_id}"
         cached_data = cache.get(cache_key)
+        
         if cached_data:
-            print(f"Cache HIT for {cache_key}")
             return jsonify(json.loads(cached_data)), 200
-    print(f"Cache MISS for {cache_key}")
 
-    # ... (existing code) ...
     lot = ParkingLot.query.get(lot_id)
     if not lot:
         return jsonify({"message": "Lot not found"}), 404
 
     spots = ParkingSpot.query.filter_by(lot_id=lot_id).order_by(ParkingSpot.spot_number).all()
+
     spot_details = []
     for spot in spots:
         spot_info = {
@@ -432,15 +293,18 @@ def get_lot_details(lot_id):
             'spot_number': spot.spot_number,
             'status': spot.status
         }
+        
         if spot.status == 'occupied':
             active_booking = Booking.query.filter_by(
                 spot_id=spot.id, 
                 is_active=True
             ).first()
+            
             if active_booking:
                 user = User.query.get(active_booking.user_id)
                 spot_info['booked_by_user'] = user.username
-                spot_info['check_in_time'] = str(active_booking.check_in_time)
+                spot_info['check_in_time'] = active_booking.check_in_time.isoformat()
+            
         spot_details.append(spot_info)
 
     result = {
@@ -450,178 +314,298 @@ def get_lot_details(lot_id):
         'spots': spot_details
     }
     
-    # --- NEW: Save to cache ---
     if cache:
-        cache.setex(cache_key, 300, json.dumps(result))
-    
+        cache.setex(cache_key, 30, json.dumps(result))
     return jsonify(result), 200
 
-@app.route('/api/admin/lots/<int:lot_id>', methods=['DELETE'])
+# ==========================================
+# USER ROUTES (Booking)
+# ==========================================
+
+@app.route('/api/lots', methods=['GET'])
 @jwt_required()
-@admin_required()
-def delete_lot(lot_id):
-    # ... (existing code) ...
-    lot = ParkingLot.query.get(lot_id)
-    if not lot:
-        return jsonify({"message": "Lot not found"}), 404
+def browse_available_lots():
+    # Cache key for user view of lots
+    if cache:
+        cache_key = "user_available_lots"
+        cached = cache.get(cache_key)
+        if cached:
+            return jsonify(json.loads(cached)), 200
 
-    occupied_spots = ParkingSpot.query.filter_by(
-        lot_id=lot_id, 
-        status='occupied'
-    ).count()
+    # Only return lots that have at least one 'available' spot
+    # Using a JOIN query for efficiency
+    active_lots = db.session.query(ParkingLot).join(ParkingSpot).filter(
+        ParkingSpot.status == 'available'
+    ).group_by(ParkingLot.id).all()
 
-    if occupied_spots > 0:
-        return jsonify({
-            "message": f"Cannot delete lot. {occupied_spots} spot(s) are still occupied."
-        }), 409
+    response = []
+    for l in active_lots:
+        response.append({
+            'id': l.id,
+            'name': l.name,
+            'address': l.address,
+            'price_per_hour': l.price_per_hour
+        })
+    
+    if cache:    
+        cache.setex(cache_key, 60, json.dumps(response))
+    return jsonify(response), 200
 
-    db.session.delete(lot)
+@app.route('/api/book', methods=['POST'])
+@jwt_required()
+def create_booking():
+    """Books the first available spot in a chosen lot."""
+    user_id = int(get_jwt_identity())
+    req = request.get_json()
+    target_lot_id = req.get('lot_id')
+    
+    # --- NEW: Get scheduled times from request ---
+    start_str = req.get('start_time') # Expected format: ISO 8601 string
+    end_str = req.get('end_time')
+    
+    scheduled_start = None
+    scheduled_end = None
+    estimated_cost = 0.0
+    
+    if start_str and end_str:
+        try:
+            # Parse the date strings
+            scheduled_start = datetime.datetime.fromisoformat(start_str.replace('Z', '+00:00'))
+            scheduled_end = datetime.datetime.fromisoformat(end_str.replace('Z', '+00:00'))
+            
+            # Basic validation
+            if scheduled_start < datetime.datetime.utcnow():
+                return jsonify({"message": "Start time cannot be in the past"}), 400
+            if scheduled_end <= scheduled_start:
+                return jsonify({"message": "End time must be after start time"}), 400
+                
+        except ValueError:
+            return jsonify({"message": "Invalid date format"}), 400
+
+    # Find the first empty spot in the requested lot
+    spot = ParkingSpot.query.filter_by(lot_id=target_lot_id, status='available').first()
+    
+    if not spot:
+        print(f"DEBUG: User {user_id} tried to book full lot {target_lot_id}")
+        return jsonify({"message": "Lot is full"}), 404
+
+    # Lock the spot
+    spot.status = 'occupied'
+    
+    # --- NEW: Calculate Estimated Cost ---
+    if scheduled_start and scheduled_end:
+        duration = scheduled_end - scheduled_start
+        hours = duration.total_seconds() / 3600
+        lot = ParkingLot.query.get(target_lot_id)
+        estimated_cost = round(hours * lot.price_per_hour, 2)
+    
+    # Create booking record
+    new_booking = Booking(
+        user_id=user_id,
+        spot_id=spot.id,
+        check_in_time=datetime.datetime.utcnow(),
+        scheduled_start_time=scheduled_start,      # --- NEW
+        scheduled_end_time=scheduled_end,          # --- NEW
+        is_active=True
+    )
+    
+    db.session.add(new_booking)
+    db.session.add(spot)
     db.session.commit()
     
-    # --- NEW: Clear relevant caches ---
+    # Invalidate relevant caches
     clear_cache([
-        '/api/lots', '/api/admin/lots', '/api/admin/summary',
-        f'/api/admin/lots/{lot_id}'
-    ])
-
-    return jsonify({"message": f"Lot '{lot.name}' and all its spots have been deleted."}), 200
-
-@app.route('/api/admin/lots/<int:lot_id>', methods=['PUT'])
-@jwt_required()
-@admin_required()
-def update_lot(lot_id):
-    # ... (existing code) ...
-    lot = ParkingLot.query.get(lot_id)
-    if not lot:
-        return jsonify({"message": "Lot not found"}), 404
-
-    data = request.get_json()
-    
-    if 'capacity' in data:
-        new_capacity = int(data.get('capacity'))
-        current_capacity = lot.capacity
-        if new_capacity < 0:
-            return jsonify({"message": "Capacity cannot be negative"}), 400
-        occupied_spots_count = ParkingSpot.query.filter_by(
-            lot_id=lot_id, 
-            status='occupied'
-        ).count()
-        if new_capacity < occupied_spots_count:
-            return jsonify({
-                "message": f"Cannot reduce capacity to {new_capacity}. "
-                           f"{occupied_spots_count} spots are currently occupied."
-            }), 409
-        if new_capacity > current_capacity:
-            for i in range(current_capacity + 1, new_capacity + 1):
-                spot = ParkingSpot(lot_id=lot.id, spot_number=i, status='available')
-                db.session.add(spot)
-        elif new_capacity < current_capacity:
-            spots_to_remove = ParkingSpot.query.filter(
-                ParkingSpot.lot_id == lot_id,
-                ParkingSpot.status == 'available'
-            ).order_by(ParkingSpot.spot_number.desc()).limit(current_capacity - new_capacity).all()
-            for spot in spots_to_remove:
-                db.session.delete(spot)
-        lot.capacity = new_capacity
-
-    if 'name' in data:
-        lot.name = data.get('name')
-    if 'address' in data:
-        lot.address = data.get('address')
-    if 'pincode' in data:
-        lot.pincode = data.get('pincode')
-    if 'price_per_hour' in data:
-        lot.price_per_hour = data.get('price_per_hour')
-
-    db.session.commit()
-    
-    # --- NEW: Clear relevant caches ---
-    clear_cache([
-        '/api/lots', '/api/admin/lots', '/api/admin/summary',
-        f'/api/admin/lots/{lot_id}'
+        "admin_all_lots", 
+        "user_available_lots", 
+        f"lot_details_{target_lot_id}",
+        "admin_dashboard_stats",
+        f"user_stats_{user_id}",
+        f"user_bookings_{user_id}"
     ])
     
+    print(f"DEBUG: Booking #{new_booking.id} created for User {user_id}")
     return jsonify({
-        "message": "Lot updated successfully",
-        "lot_id": lot.id,
-        "new_capacity": lot.capacity
+        "message": "Booking confirmed", 
+        "spot_number": spot.spot_number,
+        "estimated_cost": estimated_cost # --- NEW
+    }), 201
+
+@app.route('/api/release/<int:booking_id>', methods=['PUT'])
+@jwt_required()
+def end_booking(booking_id):
+    """Ends a booking and calculates the cost."""
+    user_id = int(get_jwt_identity())
+    
+    # Verify the booking belongs to this user and is active
+    booking = Booking.query.filter_by(id=booking_id, user_id=user_id, is_active=True).first()
+    
+    if not booking:
+        return jsonify({"message": "Booking not found or already closed"}), 404
+
+    # Calculate duration
+    now = datetime.datetime.utcnow()
+    duration = now - booking.check_in_time
+    hours = duration.total_seconds() / 3600
+    
+    # Calculate final cost
+    spot = ParkingSpot.query.get(booking.spot_id)
+    lot = ParkingLot.query.get(spot.lot_id)
+    cost = round(hours * lot.price_per_hour, 2)
+    
+    # Update DB records
+    booking.is_active = False
+    booking.check_out_time = now
+    booking.total_cost = cost
+    spot.status = 'available'
+    
+    db.session.commit()
+    
+    # Invalidate caches
+    clear_cache([
+        "admin_all_lots", 
+        "user_available_lots", 
+        f"lot_details_{spot.lot_id}",
+        "admin_dashboard_stats",
+        f"user_stats_{user_id}",
+        f"user_bookings_{user_id}"
+    ])
+
+    return jsonify({
+        "message": "Booking ended", 
+        "cost": cost
     }), 200
+
+@app.route('/api/bookings', methods=['GET'])
+@jwt_required()
+def my_bookings_history():
+    """Fetches booking history for the current user."""
+    user_id = int(get_jwt_identity())
+    
+    if cache:
+        cache_key = f"user_bookings_{user_id}"
+        cached = cache.get(cache_key)
+        if cached:
+            return jsonify(json.loads(cached)), 200
+
+    history = Booking.query.filter_by(user_id=user_id).order_by(Booking.check_in_time.desc()).all()
+    
+    data = []
+    for h in history:
+        spot = ParkingSpot.query.get(h.spot_id)
+        lot = ParkingLot.query.get(spot.lot_id)
+        data.append({
+            'booking_id': h.id,
+            'lot_name': lot.name,
+            'spot_number': spot.spot_number,
+            'check_in_time': h.check_in_time.isoformat(),
+            'total_cost': h.total_cost,
+            'is_active': h.is_active
+        })
+    
+    if cache:    
+        cache.setex(cache_key, 30, json.dumps(data))
+    return jsonify(data), 200
+
+# ==========================================
+# DASHBOARD & ANALYTICS
+# ==========================================
+
+@app.route('/api/user/summary', methods=['GET'])
+@jwt_required()
+def user_dashboard_stats():
+    """Returns aggregated stats for the user dashboard."""
+    uid = int(get_jwt_identity())
+    
+    if cache:
+        cache_key = f"user_stats_{uid}"
+        cached = cache.get(cache_key)
+        if cached: return jsonify(json.loads(cached)), 200
+    
+    # Simple counters
+    count = Booking.query.filter_by(user_id=uid).count()
+    active = Booking.query.filter_by(user_id=uid, is_active=True).count()
+    
+    # SQLAlchemy aggregation for total spent
+    spent = db.session.query(db.func.sum(Booking.total_cost)).filter(
+        Booking.user_id == uid, Booking.is_active == False
+    ).scalar() or 0.0
+
+    result = {
+        'total_bookings': count,
+        'active_bookings': active,
+        'total_spent': round(spent, 2)
+    }
+    
+    if cache:
+        cache.setex(cache_key, 60, json.dumps(result))
+    return jsonify(result), 200
 
 @app.route('/api/admin/summary', methods=['GET'])
 @jwt_required()
-@admin_required()
-def get_admin_summary():
-    # --- NEW: Caching Logic ---
-    cache_key = '/api/admin/summary'
+@admin_access_only()
+def admin_dashboard_stats():
+    """Returns aggregated stats for the admin dashboard."""
     if cache:
-        cached_data = cache.get(cache_key)
-        if cached_data:
-            print(f"Cache HIT for {cache_key}")
-            return jsonify(json.loads(cached_data)), 200
-    print(f"Cache MISS for {cache_key}")
+        cache_key = "admin_dashboard_stats"
+        cached = cache.get(cache_key)
+        if cached: return jsonify(json.loads(cached)), 200
+
+    # Global counters
+    users = User.query.filter_by(role='user').count()
+    lots = ParkingLot.query.count()
     
-    # ... (existing code) ...
-    total_users = User.query.filter_by(role='user').count()
-    total_lots = ParkingLot.query.count()
-    total_spots = ParkingSpot.query.count()
-    spots_available = ParkingSpot.query.filter_by(status='available').count()
-    spots_occupied = ParkingSpot.query.filter_by(status='occupied').count()
-    total_revenue = db.session.query(
-        db.func.sum(Booking.total_cost)
-    ).filter(Booking.is_active == False).scalar()
+    # Spot usage counters
+    occupied = ParkingSpot.query.filter_by(status='occupied').count()
+    free = ParkingSpot.query.filter_by(status='available').count()
+    
+    revenue = db.session.query(db.func.sum(Booking.total_cost)).filter(
+        Booking.is_active == False
+    ).scalar() or 0.0
 
     result = {
-        'total_users': total_users,
-        'total_lots': total_lots,
-        'total_spots': total_spots,
-        'spots_available': spots_available,
-        'spots_occupied': spots_occupied,
-        'total_revenue': round(total_revenue or 0, 2) 
+        'total_users': users,
+        'total_lots': lots,
+        'total_spots': occupied + free,
+        'spots_available': free,
+        'spots_occupied': occupied,
+        'total_revenue': round(revenue, 2)
     }
     
-    # --- NEW: Save to cache ---
     if cache:
-        cache.setex(cache_key, 300, json.dumps(result))
-
+        cache.setex(cache_key, 120, json.dumps(result))
     return jsonify(result), 200
 
 @app.route('/api/admin/users', methods=['GET'])
 @jwt_required()
-@admin_required()
-def get_all_users():
-    # --- NEW: Caching Logic ---
-    cache_key = '/api/admin/users'
-    if cache:
-        cached_data = cache.get(cache_key)
-        if cached_data:
-            print(f"Cache HIT for {cache_key}")
-            return jsonify(json.loads(cached_data)), 200
-    print(f"Cache MISS for {cache_key}")
-
-    # ... (existing code) ...
+@admin_access_only()
+def list_registered_users():
+    """Lists all registered users for the admin."""
     users = User.query.filter_by(role='user').all()
-    if not users:
-        return jsonify([]), 200
+    return jsonify([{
+        'id': u.id, 
+        'username': u.username, 
+        'email': u.email
+    } for u in users]), 200
 
-    results = []
-    for user in users:
-        results.append({
-            'id': user.id,
-            'username': user.username,
-            'email': user.email
-        })
-        
-    # --- NEW: Save to cache ---
-    if cache:
-        cache.setex(cache_key, 300, json.dumps(results))
+@app.route('/api/export-csv', methods=['POST'])
+@jwt_required()
+def trigger_export_job():
+    """Starts the background CSV export job."""
+    # Import locally to avoid circular dependency with celery_worker
+    from tasks import generate_csv_task
     
-    return jsonify(results), 200
+    uid = int(get_jwt_identity())
+    print(f"DEBUG: Queueing CSV export for user {uid}")
+    
+    # Send task to Redis queue
+    generate_csv_task.delay(uid)
+    
+    return jsonify({"message": "Export started. Check your email."}), 202
 
-# --- Routes (for testing) ---
+# Health Check Route
 @app.route('/')
-def home():
-    return "Our API is running! We have /api/register and /api/login."
+def health_check():
+    return "ParkPrime API is running."
 
-# --- Run the App ---
 if __name__ == '__main__':
     app.run(debug=True)

@@ -1,134 +1,163 @@
-# tasks.py
 import csv
 import io
-from app import app, db  # We need app for mail configuration
-from models import Booking, User, ParkingSpot, ParkingLot
-from flask_mail import Mail, Message
+import datetime
 from celery_worker import celery
-from models import User
-import time
+from app import app
+from models import User, Booking, ParkingSpot, ParkingLot
+from flask_mail import Mail, Message
+from dateutil.relativedelta import relativedelta
 
+# This task simulates a long calculation (adding numbers)
+# just to verify that Celery workers are active.
 @celery.task
-def add(x, y):
-    """A simple test task that adds two numbers."""
-    time.sleep(5)  # Simulate a 5-second job
+def test_task_add(x, y):
     return x + y
 
 @celery.task
-def hello_world():
-    """A simple test task to make sure Celery is running."""
-    print("Hello from Celery!")
-    return "Hello from Celery!"
-
-# tasks.py
-
-# ... (other imports and tasks) ...
-
-@celery.task
 def generate_csv_task(user_id):
-    """Generates a CSV of all bookings for a user and emails it."""
-
-    # We must create a 'mail' instance *inside* the task
+    """
+    Triggered by the user from the dashboard. Fetches their history, 
+    converts it to CSV format, and emails it as an attachment.
+    """
+    print(f"DEBUG: Starting CSV export job for user_id: {user_id}")
+    
     with app.app_context():
         mail = Mail(app)
+        current_user = User.query.get(user_id)
+        
+        if not current_user:
+            print("ERROR: User ID not found in database during export.")
+            return "Failed: User not found"
 
-        user = User.query.get(user_id)
-        if not user:
-            return "User not found"
+        # Get booking history sorted by newest first
+        user_history = Booking.query.filter_by(user_id=user_id).order_by(Booking.check_in_time.desc()).all()
 
-        # Fetch all user bookings
-        bookings = Booking.query.filter_by(user_id=user_id).order_by(Booking.check_in_time.desc()).all()
+        if not user_history:
+            print("DEBUG: No history found for this user. Nothing to export.")
+            return "No bookings to export."
 
-        if not bookings:
-            # You could email the user "No bookings found" or just log it
-            return "No bookings found for user"
-
-        # --- Create CSV in memory ---
-        # io.StringIO is a way to create a text file in memory
-        si = io.StringIO()
-        writer = csv.writer(si)
-
-        # Write header
-        writer.writerow([
-            'Booking ID', 'Lot Name', 'Spot Number', 
-            'Check-In Time', 'Check-Out Time', 'Total Cost'
+        # Create the file in memory (RAM) using StringIO instead of saving to disk
+        output_buffer = io.StringIO()
+        csv_writer = csv.writer(output_buffer)
+        
+        # Add column headers
+        csv_writer.writerow([
+            'Booking Ref', 'Location Name', 'Spot Number', 
+            'Start Time', 'End Time', 'Billed Amount'
         ])
-
-        # Write data rows
-        for booking in bookings:
-            spot = ParkingSpot.query.get(booking.spot_id)
-            lot = ParkingLot.query.get(spot.lot_id)
-            writer.writerow([
-                booking.id,
-                lot.name,
-                spot.spot_number,
-                booking.check_in_time,
-                booking.check_out_time,
-                booking.total_cost
+        
+        # Populate rows
+        for record in user_history:
+            spot_data = ParkingSpot.query.get(record.spot_id)
+            lot_data = ParkingLot.query.get(spot_data.lot_id)
+            
+            csv_writer.writerow([
+                record.id,
+                lot_data.name,
+                spot_data.spot_number,
+                record.check_in_time,
+                record.check_out_time,
+                record.total_cost
             ])
-
-        # --- Email the CSV ---
-        # Reset the file "cursor" to the beginning
-        si.seek(0)
-
-        msg = Message(
-            subject="Your Parking History Export",
-            recipients=[user.email],
-            body="Here is your parking history, attached as a CSV file."
+        
+        # Rewind buffer to start so it can be read
+        output_buffer.seek(0)
+        
+        # Prepare email
+        email_msg = Message(
+            subject="ParkPrime: Your Requested Booking History",
+            recipients=[current_user.email],
+            body=f"Hello {current_user.username},\n\nPlease find attached the parking history you requested from your dashboard.\n\nRegards,\nParkPrime Team"
         )
-
-        # Attach the file
-        msg.attach(
-            "parking_history.csv",
+        
+        # Attach the CSV file
+        email_msg.attach(
+            "my_parking_history.csv",
             "text/csv",
-            si.getvalue()
+            output_buffer.getvalue()
         )
-
-        mail.send(msg)
-
-        return f"Successfully generated and emailed report to {user.email}"
-
-# tasks.py
-# ... (other imports)
+        
+        mail.send(email_msg)
+        print(f"DEBUG: CSV email successfully sent to {current_user.email}")
+        
+        return "Export task completed successfully."
 
 @celery.task
 def send_daily_reminders():
     """
-    Finds all users and sends them a promotional "reminder" email.
+    Scheduled Task: Runs every day to remind users about the service availability.
     """
+    print("DEBUG: Starting daily reminder batch process...")
+    
+    with app.app_context():
+        mail = Mail(app)
+        # Get all regular users (exclude admins)
+        all_users = User.query.filter_by(role='user').all()
+
+        if not all_users:
+            return "No users found to remind."
+
+        for u in all_users:
+            msg = Message(
+                subject="Need a parking spot?",
+                recipients=[u.email],
+                body=f"Hey {u.username},\n\nDon't forget to book your spot ahead of time to avoid the rush! Check out our available lots.\n\n- ParkPrime"
+            )
+            mail.send(msg)
+            print(f"DEBUG: Daily reminder sent to {u.email}")
+            
+        return f"Batch complete. Reminded {len(all_users)} users."
+
+@celery.task
+def send_monthly_reports():
+    """
+    Scheduled Task: Calculates total spending for the previous month and emails a summary report.
+    """
+    print("DEBUG: Calculating monthly statistics...")
+    
     with app.app_context():
         mail = Mail(app)
         users = User.query.filter_by(role='user').all()
+        
+        # Calculate date range for "Last Month"
+        today = datetime.date.today()
+        this_month_start = today.replace(day=1)
+        prev_month_start = this_month_start - relativedelta(months=1)
+        prev_month_end = this_month_start - datetime.timedelta(days=1)
+        
+        month_name = prev_month_start.strftime('%B %Y')
+        print(f"DEBUG: Processing reports for period: {month_name}")
 
-        if not users:
-            print("No users found to remind.")
-            return "No users."
-
-        print(f"Sending reminders to {len(users)} user(s)...")
-
-        # In a real app, you'd check if they booked today
-        # For this, we'll just email everyone.
         for user in users:
-            msg = Message(
-                subject="We've got a spot for you!",
-                recipients=[user.email],
-                body=f"Hi {user.username},\n\n"
-                     f"Just a friendly reminder that we have plenty of parking spots "
-                     f"available. Book your spot today!\n\n"
-                     f"- The Vehicle Parking App Team"
-            )
-            mail.send(msg)
-            print(f"Sent reminder to {user.email}")
+            # SQL query to find bookings in date range
+            month_bookings = Booking.query.filter(
+                Booking.user_id == user.id,
+                Booking.check_in_time >= prev_month_start,
+                Booking.check_in_time <= prev_month_end
+            ).all()
+
+            count = len(month_bookings)
+            # Sum up costs, handling None values
+            total_bill = sum(b.total_cost for b in month_bookings if b.total_cost)
             
-        return f"Sent reminders to {len(users)} users."
-
-# --- We will add our real tasks here later ---
-# @celery.task
-# def send_daily_reminders():
-#     # ... logic to find active bookings and send emails
-#     print("Sending daily reminders...")
-
-# @celery.task
-# def generate_monthly_report():
-#     # ... logic to generate a report
-#     print("Generating monthly report...")
+            # Simple HTML template for the email
+            html_content = f"""
+            <h3>Monthly Activity Report: {month_name}</h3>
+            <p>Dear {user.username},</p>
+            <p>Here is your usage summary for last month:</p>
+            <ul>
+                <li><strong>Total Parkings:</strong> {count}</li>
+                <li><strong>Amount Spent:</strong> ${round(total_bill, 2)}</li>
+            </ul>
+            <p>Thank you for using ParkPrime!</p>
+            """
+            
+            msg = Message(
+                subject=f"ParkPrime Activity Report - {month_name}",
+                recipients=[user.email],
+                html=html_content
+            )
+            
+            mail.send(msg)
+            
+        return f"Monthly reports sent to {len(users)} users."

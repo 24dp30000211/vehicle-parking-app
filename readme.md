@@ -36,7 +36,7 @@ Icons: Bootstrap Icons
 
 User Dashboard: View active bookings, total spending, and parking history.
 
-Book a Spot: Browse available parking lots and book a specific spot instantly.
+Book a Spot: Browse available parking lots and book a specific spot instantly or schedule for later.
 
 My Bookings: View current and past bookings.
 
@@ -55,40 +55,34 @@ Capacity Management: Increase or decrease lot capacity dynamically.
 View Users: Monitor registered users.
 
 Reports: Automated monthly activity reports generated and emailed via Celery Beat.
+--------------------------------------------------------------
 
-🚀 Installation & Setup
+🚀 Installation & Setup (One-Time)
 
-Prerequisites
-
-Python 3.8+
-
-Node.js & npm
-
-Redis Server (Must be installed and running)
+Prerequisites: Python 3.8+, Node.js & npm, Redis Server (Must be installed and running).
 
 1. Backend Setup
 
-Navigate to the backend folder and set up the Python environment.
+Navigate to the backend folder and set up the Python virtual environment.
 
 cd backend
 python -m venv venv
-# Windows:
+# Activate the environment (Windows):
 .\venv\Scripts\Activate
-# Mac/Linux:
-source venv/bin/activate
-
+# Install dependencies:
 pip install -r requirements.txt
-
+--------------------------------------------------------------
 
 2. Database Initialization
 
-Initialize the SQLite database and create the admin user.
+If this is your first time running it, or if you deleted parking.db:
 
 # Ensure you are in the /backend folder with venv activated
 flask shell
 >>> db.create_all()
 >>> exit()
-
+--------------------------------------------------------------
+# Create the admin user
 python create_admin.py
 
 
@@ -99,65 +93,129 @@ Navigate to the frontend folder and install dependencies.
 cd ../frontend
 npm install
 
+--------------------------------------------------------------
+🏃‍♂️ Run Guide (The 5 Terminals)
 
-🏃‍♂️ How to Run the Application
+This application requires 5 separate terminals to simulate the full production environment.
 
-This application requires 5 separate terminals to simulate the full production environment (Server, Worker, Scheduler, Email, Client).
+📥 How to Download & Run (From Portal Zip)
 
-Terminal 1: Dummy Email Server
+If you have just downloaded the project zip file from the submission portal:
 
-Catches emails sent by the app (e.g., CSV exports) and prints them to the console.
+1. Unzip the file to a location on your computer (e.g., Desktop).
+
+2. Open VS Code and select File > Open Folder.... Choose the unzipped folder (it should contain backend and frontend).
+
+3. Open 5 Terminals in VS Code (Terminal -> New Terminal) and run the following commands in order:
+--------------------------------------------------------------
+
+Terminal 1: Email Server
+
+What it does: Catches emails sent by the app (e.g., CSV exports) and prints them to the console.
 
 python -m aiosmtpd -n -l localhost:1025
-
+--------------------------------------------------------------
 
 Terminal 2: Flask Backend API
 
-Runs the core API server at http://localhost:5000.
+What it does: Runs the core API server at http://localhost:5000.
 
 cd backend
 .\venv\Scripts\Activate
+# If venv doesn't exist (fresh download), recreate it:
+# python -m venv venv
+# .\venv\Scripts\Activate
+# pip install -r requirements.txt
+
 python app.py
 
+--------------------------------------------------------------
 
 Terminal 3: Celery Worker
 
-Processes background tasks (CSV generation).
+What it does: Processes background tasks (CSV generation).
 
 cd backend
 .\venv\Scripts\Activate
 celery -A celery_worker.celery worker --loglevel=info -P solo
-
+--------------------------------------------------------------
 
 Terminal 4: Celery Beat Scheduler
 
-Triggers scheduled tasks (Daily Reminders, Monthly Reports).
+What it does: Triggers scheduled tasks (Daily Reminders, Monthly Reports).
 
 cd backend
 .\venv\Scripts\Activate
 celery -A celery_worker.celery beat --loglevel=info
 
+--------------------------------------------------------------
 
 Terminal 5: Vue.js Frontend
 
-Runs the user interface at http://localhost:8080.
+What it does: Runs the user interface at http://localhost:8080.
 
 cd frontend
+# If node_modules is missing (fresh download), install it:
+# npm install
+
 npm run serve
 
+--------------------------------------------------------------
 
-🧪 Testing the App
+🧪 Testing & Login Credentials
 
-Open your browser and go to http://localhost:8080/.
+Once all terminals are running, open your browser and go to: http://localhost:8080/
 
-Admin Login:
+Admin Login
+
 Username: admin
+
 Password: adminpassword
 
-User Login:
-Register a new account via the UI, or use:
+User Login
+
 Username: testuser
+
 Password: securepassword
+
+(Or register a new user via the "Register here" link)
+--------------------------------------------------------------
+
+How to Test CSV Export (Background Job)
+
+Log in as a User.
+
+Go to the User Dashboard.
+
+Click the "Export History (CSV)" button.
+
+Go to Terminal 1 (Email Server). You will see the email content printed there with the CSV attachment code.
+
+🆘 Troubleshooting (Panic Button)
+
+If the database gets corrupted or you want a fresh start:
+
+Stop Terminal 2, 3, and 4 (Ctrl+C).
+
+Go to the backend folder and delete the file parking.db.
+--------------------------------------------------------------
+
+Run these commands in Terminal 2:
+
+flask shell
+>>> db.create_all()
+>>> exit()
+python create_admin.py
+python app.py
+--------------------------------------------------------------
+
+Restart Terminals 3 and 4.
+
+If "venv" errors appear:
+Run this command in PowerShell to allow scripts:
+
+Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope Process
+--------------------------------------------------------------
 
 📂 Project Structure
 
